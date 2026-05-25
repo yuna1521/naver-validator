@@ -4,16 +4,25 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-from core import validate_dataframe
+from core import validate_dataframe, set_credentials
 from excel_writer import save_to_excel_bytes
 
-
-# 페이지 설정
+# 1) 페이지 설정 — 반드시 가장 먼저
 st.set_page_config(
     page_title="입점 상품 최저가 검수",
     page_icon="📋",
     layout="wide",
 )
+
+# 2) Streamlit Cloud의 Secrets를 core에 주입 (있을 때만)
+try:
+    set_credentials(
+        st.secrets.get("NAVER_CLIENT_ID"),
+        st.secrets.get("NAVER_CLIENT_SECRET"),
+    )
+except Exception:
+    # 로컬에서는 secrets 없으니 .env로 진행 (이미 core가 처리)
+    pass
 
 st.title("📋 입점 상품 최저가 검수")
 st.caption("브랜드사 제출 엑셀을 업로드하면 자동으로 검수합니다.")

@@ -8,15 +8,17 @@ import pandas as pd
 from dotenv import load_dotenv
 
 load_dotenv()
+CLIENT_ID = os.getenv("NAVER_CLIENT_ID")
+CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET")
 
-# Streamlit Cloud에서는 st.secrets에서, 로컬에서는 .env에서 읽기
-try:
-    import streamlit as st
-    CLIENT_ID = st.secrets.get("NAVER_CLIENT_ID") or os.getenv("NAVER_CLIENT_ID")
-    CLIENT_SECRET = st.secrets.get("NAVER_CLIENT_SECRET") or os.getenv("NAVER_CLIENT_SECRET")
-except Exception:
-    CLIENT_ID = os.getenv("NAVER_CLIENT_ID")
-    CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET")
+
+def set_credentials(client_id, client_secret):
+    """외부(app.py 등)에서 API 자격 정보를 주입할 때 사용."""
+    global CLIENT_ID, CLIENT_SECRET
+    if client_id:
+        CLIENT_ID = client_id
+    if client_secret:
+        CLIENT_SECRET = client_secret
 
 
 # ============================================================
