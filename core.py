@@ -26,8 +26,6 @@ def set_credentials(client_id, client_secret):
 # ============================================================
 # 새 양식 컬럼 매핑 (애드웰 상품제안서)
 # ============================================================
-# 원본 양식의 컬럼명이 길어 내부 표준 이름으로 매핑.
-# 양식이 또 바뀌면 이 부분만 수정하면 됨.
 COL_MAP = {
     "no": "NO",
     "category": "카테고리",
@@ -47,8 +45,15 @@ COL_MAP = {
     "show_price": "가격 노출여부",
 }
 
-# 검수 대상으로 인식할 첫 시트 이름 (정확히 일치할 필요는 없고 keyword 포함)
-SHEET_NAME_KEYWORD = "상품"
+# 가격 합리성 필터: 기재 최저가의 30%~300% 범위 안만 후보로 인정
+PRICE_RANGE_MIN_RATIO = 0.3
+PRICE_RANGE_MAX_RATIO = 3.0
+
+# 모델명 미일치 시 fallback 점수 (다른 키워드가 모두 맞을 때 부여)
+MODEL_FALLBACK_SCORE = 0.7
+
+# 매칭 임계값
+MATCH_THRESHOLD = 0.7
 
 
 # ============================================================
@@ -59,44 +64,27 @@ def clean_text(text):
 
 
 def extract_model_code(product_name):
-    """상품명에서 모델 코드 추출 (예: AQ-75, ICE-43T, AGC-5000W).
-    
-    규칙: 대문자/숫자/하이픈이 섞인 3자 이상 토큰.
-    숫자만이거나 한글이 섞이면 제외.
-    """
+    """상품명에서 모델 코드 추출 (예: AQ-75, ICE-43T, AGC-5000W)."""
     name = str(product_name)
-    # 괄호 안 내용 제거 (색상 옵션 등): [브랜드]는 살리고 (베이지, 블랙)은 제거
     name_clean = re.sub(r"\([^)]*\)", "", name)
-    
-    # 영문 대문자/숫자/하이픈 3자 이상
     pattern = r"\b([A-Z][A-Z0-9\-]{2,})\b"
     candidates = re.findall(pattern, name_clean)
-    
-    # 너무 짧거나 숫자만인 것 제외
     codes = [c for c in candidates if len(c) >= 3 and not c.isdigit()]
     return codes
 
 
 def extract_keywords(product_name):
-    """매칭에 쓸 일반 키워드 추출.
-    
-    - [브랜드] 접두는 제거
-    - 괄호 안 옵션 정보 제거
-    - 2글자 이상 토큰만
-    """
+    """매칭에 쓸 일반 키워드 추출."""
     name = str(product_name)
-    # [브랜드] 접두 제거
     name = re.sub(r"^\[[^\]]+\]", "", name)
-    # 괄호 안 옵션 제거
     name = re.sub(r"\([^)]*\)", "", name)
-    
     tokens = name.split()
     return [t for t in tokens if len(t) >= 2]
 
 
 def extract_units(product_name):
     """상품명에서 '숫자+단위' 패턴 추출."""
-    pattern = r"(\d+(?:\.\d+)?)\s*(ml|l|g|kg|포|개|정|캡슐|환|매|입|병|봉|팩|세트)"
+    pattern = r"(\d+(?:\.\d+)?)\s*(ml|l|g|kg|포|개입|개|정|캡슐|환|매|입|병|봉|팩|세트|박스)"
     matches = re.findall(pattern, str(product_name), flags=re.IGNORECASE)
     return [f"{num}{unit.lower()}" for num, unit in matches]
 
@@ -105,28 +93,51 @@ def match_score(product_name, item_title):
     """원본 상품명과 검색결과 제목의 일치도.
     
     우선순위:
-    1. 모델 코드가 양쪽에 있고 일치 → 1.0
-    2. 모델 코드가 원본에 있는데 결과에 없음 → 0.0
-    3. 모델 코드 없는 경우: 단위 + 키워드 매칭
+    1. 모델 코드 양쪽 일치 → 1.0
+    2. 결과 제목에 다른 모델 코드가 있으면 → 0.0 (다른 모델 차단)
+    3. 결과 제목에 모델 코드가 없는 경우 → 키워드+단위 fallback
     """
     title_clean = clean_text(item_title)
     
-    # 1단계: 모델 코드 매칭 (최우선)
     원본_코드들 = extract_model_code(product_name)
     if 원본_코드들:
+        # 1. 코드 일치 확인 (가장 강력한 신호)
         for code in 원본_코드들:
             if code in title_clean.upper():
                 return 1.0
-        return 0.0  # 모델 코드가 있는데 결과에 없으면 다른 상품
+        
+        # 2. 결과 제목에 다른 모델 코드가 있는지 확인
+        # 같은 브랜드의 다른 모델 차단 (AQ-101 검색에 AQ-120 매칭되는 문제 방지)
+        제목_코드들 = extract_model_code(title_clean)
+        if 제목_코드들:
+            return 0.0
+        
+        # 3. 제목에 모델 코드가 아예 없는 경우만 fallback 시도
+        원본_단위들 = extract_units(product_name)
+        제목_단위들 = extract_units(title_clean)
+        for unit in 원본_단위들:
+            if unit not in 제목_단위들:
+                return 0.0
+        
+        keywords = extract_keywords(product_name)
+        if not keywords:
+            return 0.0
+        keywords = [kw for kw in keywords if not any(code in kw.upper() for code in 원본_코드들)]
+        if not keywords:
+            return 0.0
+        
+        matched = sum(1 for kw in keywords if kw in title_clean)
+        if matched == len(keywords):
+            return MODEL_FALLBACK_SCORE
+        return 0.0
     
-    # 2단계: 단위 엄격 검사
+    # 모델 코드 없는 경우: 단위 + 키워드 일반 매칭
     원본_단위들 = extract_units(product_name)
     제목_단위들 = extract_units(title_clean)
     for unit in 원본_단위들:
         if unit not in 제목_단위들:
             return 0.0
     
-    # 3단계: 키워드 매칭
     keywords = extract_keywords(product_name)
     if not keywords:
         return 0.0
@@ -135,72 +146,144 @@ def match_score(product_name, item_title):
 
 
 # ============================================================
+# 검색 쿼리 정제
+# ============================================================
+def _strip_parens(product_name):
+    """검색 쿼리 정제: 괄호 안 내용 제거. 단, 맨 앞 [브랜드]는 유지.
+    
+    예: "[아이리버] 핸디형 선풍기 ICE-43T(베이지, 블랙)"
+        → "[아이리버] 핸디형 선풍기 ICE-43T"
+    """
+    name = str(product_name)
+    
+    # 맨 앞 [브랜드] 보존
+    m = re.match(r"^(\[[^\]]+\])", name)
+    brand_prefix = m.group(1) if m else ""
+    rest = name[len(brand_prefix):] if brand_prefix else name
+    
+    # 나머지에서 () 와 [] 안 내용 제거
+    rest = re.sub(r"\([^)]*\)", "", rest)
+    rest = re.sub(r"\[[^\]]*\]", "", rest)
+    rest = re.sub(r"\s+", " ", rest).strip()
+    
+    if brand_prefix:
+        return f"{brand_prefix} {rest}".strip()
+    return rest
+
+
+# ============================================================
 # 네이버 가격 조회
 # ============================================================
-def search_naver_price(product_name, brand_name):
-    """네이버 검색 후 매칭/필터링하여 최저가와 가격 분포 반환.
+def _do_naver_search(query, product_name, brand_name, stated_lowest):
+    """실제 API 호출 + 매칭. search_naver_price의 내부 헬퍼.
     
-    반환:
-    {
-        "status": "OK" | "NO_MATCH" | "API_LIMIT" | "ERROR",
-        "price": int | None,         # 매칭된 최저가
-        "total_count": int | None,   # 검색 결과 총 개수
-        "all_prices": [int],         # 매칭된 후보들의 가격 리스트 (시장 풍부도/가격 변동성용)
-        "message": str,
-    }
+    - query: API에 보낼 검색어 (1차/2차에 따라 다를 수 있음)
+    - product_name: 원본 상품명 (매칭 점수 계산용, 항상 원본)
+    
+    429 응답 시 잠시 대기 후 재시도. 재시도도 실패하면 진짜 한도 초과로 판단.
+    매 호출 전 짧은 딜레이로 초당 호출 제한 회피.
     """
+    import time
+    
     if not CLIENT_ID or not CLIENT_SECRET:
-        return {"status": "ERROR", "price": None, "total_count": None, "all_prices": [], "message": "API 키 누락"}
+        return {"status": "ERROR", "price": None, "total_count": None, "all_prices": [],
+                "message": "API 키 누락"}
     
     url = "https://openapi.naver.com/v1/search/shop.json"
     headers = {"X-Naver-Client-Id": CLIENT_ID, "X-Naver-Client-Secret": CLIENT_SECRET}
-    params = {"query": str(product_name), "display": 10, "sort": "asc"}
+    params = {"query": query, "display": 10, "sort": "sim"}
     
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-    except requests.exceptions.RequestException as e:
-        return {"status": "ERROR", "price": None, "total_count": None, "all_prices": [], "message": f"네트워크 오류: {e}"}
+    # 매 호출 전 100ms 딜레이 (초당 호출 제한 회피)
+    time.sleep(0.1)
     
-    if response.status_code == 429:
-        return {"status": "API_LIMIT", "price": None, "total_count": None, "all_prices": [], "message": "API 일일 한도 도달"}
+    response = None
+    for attempt in range(2):  # 최초 1회 + 429일 때 1회 재시도
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+        except requests.exceptions.RequestException as e:
+            return {"status": "ERROR", "price": None, "total_count": None, "all_prices": [],
+                    "message": f"네트워크 오류: {e}"}
+        
+        if response.status_code == 429:
+            # 첫 429면 2초 대기 후 재시도
+            if attempt == 0:
+                time.sleep(2.0)
+                continue
+            # 재시도도 429면 진짜 한도 초과로 판단
+            return {"status": "API_LIMIT", "price": None, "total_count": None, "all_prices": [],
+                    "message": "API 호출 제한 (일일 한도 초과 가능성). 잠시 후 다시 시도하세요."}
+        
+        # 200이든 다른 오류든 루프 탈출
+        break
+    
     if response.status_code != 200:
-        return {"status": "ERROR", "price": None, "total_count": None, "all_prices": [], "message": f"API 오류 {response.status_code}"}
+        return {"status": "ERROR", "price": None, "total_count": None, "all_prices": [],
+                "message": f"API 오류 {response.status_code}"}
     
     data = response.json()
     items = data.get("items", [])
     total_count = data.get("total", 0)
     
     if not items:
-        return {"status": "NO_MATCH", "price": None, "total_count": total_count, "all_prices": [], "message": "네이버 검색 결과 0건"}
+        return {"status": "NO_MATCH", "price": None, "total_count": total_count, "all_prices": [],
+                "message": "네이버 검색 결과 0건"}
     
-    # 1차 필터: productType 1(가격비교 묶음) 제외 + 브랜드 불일치 제외
+    # 1차 필터: productType + 브랜드 + 중고/리퍼 + 가격 합리성
     brand_clean = str(brand_name).strip() if brand_name else ""
+    EXCLUDE_PRODUCT_TYPES = {"5", "6"}  # 보류 결정에 따라 이전 상태 유지
+    EXCLUDE_KEYWORDS = ["중고", "리퍼", "B급", "반품", "전시품", "미사용", "개봉"]
+    
+    price_min, price_max = None, None
+    if stated_lowest and not pd.isna(stated_lowest):
+        try:
+            stated = float(stated_lowest)
+            price_min = stated * PRICE_RANGE_MIN_RATIO
+            price_max = stated * PRICE_RANGE_MAX_RATIO
+        except (TypeError, ValueError):
+            pass
+    
     candidates = []
+    filtered_out_by_price = 0
+    
     for item in items:
-        if item.get("productType") == "1":
+        if item.get("productType") in EXCLUDE_PRODUCT_TYPES:
             continue
         item_brand = clean_text(item.get("brand", ""))
         if item_brand and brand_clean and item_brand != brand_clean:
             continue
+        title_clean = clean_text(item.get("title", ""))
+        if any(kw in title_clean for kw in EXCLUDE_KEYWORDS):
+            continue
+        if price_min is not None and price_max is not None:
+            try:
+                item_price = int(item["lprice"])
+                if item_price < price_min or item_price > price_max:
+                    filtered_out_by_price += 1
+                    continue
+            except (TypeError, ValueError, KeyError):
+                pass
         candidates.append(item)
     
     if not candidates:
+        if filtered_out_by_price > 0:
+            return {"status": "NO_MATCH", "price": None, "total_count": total_count, "all_prices": [],
+                    "message": "가격대 범위(기재가의 30%~300%) 밖 상품만 검색됨. 부속품/세트 가능성. 수동 확인 필요."}
         return {"status": "NO_MATCH", "price": None, "total_count": total_count, "all_prices": [],
-                "message": "조건 맞는 상품 없음 (네이버 묶음 또는 다른 브랜드)"}
+                "message": "조건 맞는 상품 없음 (네이버 묶음/타브랜드/중고만 검색됨)"}
     
-    # 2차: 매칭 점수 계산
+    # 2차: 매칭 점수 (매칭은 항상 원본 상품명 기준)
     scored = [{"item": i, "score": match_score(product_name, i["title"]), "price": int(i["lprice"])} for i in candidates]
-    matched = [s for s in scored if s["score"] >= 0.7]
+    matched = [s for s in scored if s["score"] >= MATCH_THRESHOLD]
     
     if not matched:
         best = max(scored, key=lambda s: s["score"])
-        # 모델 코드가 있었다면 더 친절한 메시지
         codes = extract_model_code(product_name)
         if codes:
             msg = f"모델명 {'/'.join(codes)} 일치 상품 없음. 수동 확인 필요."
         else:
             msg = f"매칭 신뢰도 낮음 (최고 {best['score']:.0%}). 수동 확인 필요."
-        return {"status": "NO_MATCH", "price": None, "total_count": total_count, "all_prices": [], "message": msg}
+        return {"status": "NO_MATCH", "price": None, "total_count": total_count, "all_prices": [],
+                "message": msg}
     
     matched_prices = [s["price"] for s in matched]
     best_match = min(matched, key=lambda s: s["price"])
@@ -214,47 +297,63 @@ def search_naver_price(product_name, brand_name):
     }
 
 
+def search_naver_price(product_name, brand_name, stated_lowest=None):
+    """네이버 검색 후 매칭/필터링하여 최저가와 가격 분포 반환.
+    
+    1차: 원본 상품명 그대로 검색
+    2차 (1차가 NO_MATCH일 때만): 괄호 안 옵션(색상/사이즈 등) 제거하고 재검색
+    """
+    # 1차 검색: 원본 상품명 그대로
+    result = _do_naver_search(str(product_name), product_name, brand_name, stated_lowest)
+    
+    # 1차가 성공이거나 API 오류면 그대로 반환
+    if result["status"] != "NO_MATCH":
+        return result
+    
+    # 1차가 NO_MATCH → 괄호 제거하고 재검색
+    relaxed_query = _strip_parens(product_name)
+    
+    # 정제 결과가 원본과 같으면 (괄호가 없던 경우) 재검색 의미 없음
+    if relaxed_query == str(product_name).strip():
+        return result
+    
+    result_2 = _do_naver_search(relaxed_query, product_name, brand_name, stated_lowest)
+    
+    # 재검색이 성공하면 그 결과 사용 + 메모에 표시
+    if result_2["status"] == "OK":
+        result_2["message"] = "완화 검색으로 매칭 (괄호 제거 쿼리)"
+        return result_2
+    
+    # 재검색도 실패면 원래 결과 메시지 유지
+    return result
+
+
 # ============================================================
-# 가격 변동성 감지 (1위만 비정상적 저가인지)
+# 가격 변동성 감지
 # ============================================================
 def detect_price_anomaly(prices):
     """매칭된 가격 리스트에서 1위만 비정상적으로 저렴한지 감지.
     
     규칙: 1위 가격 × 1.5 < 2위 가격 이면 1위가 이상치.
-    가격이 2개 미만이면 판정 불가능 (None 반환).
-    
-    반환: (is_anomaly, msg)
     """
     if len(prices) < 2:
         return False, None
-    
     first = prices[0]
     second = prices[1]
-    
     if first * 1.5 < second:
-        # 2위 이후 평균 계산
         rest_avg = int(statistics.mean(prices[1:]))
         msg = f"검색 1위만 {first:,}원으로 비정상적 저가, 2~{len(prices)}위 평균 {rest_avg:,}원. 일회성 특가 가능성, MD 확인 필요."
         return True, msg
-    
     return False, None
 
 
 # ============================================================
 # 한 행 검수
 # ============================================================
-def validate_row(row):
+def validate_row(row, tolerance_pct=5.0):
     """새 양식 한 행을 검수.
     
-    반환:
-    {
-        "_api_limit": bool,
-        "결과": "승인 가능" | "확인 필요",
-        "네이버 조회가": int | "—",
-        "차이": str,
-        "시장 풍부도": str,
-        "검수 메모": str,
-    }
+    tolerance_pct: 기재가-조회가 정합성 허용 오차 (%, 기본 5.0)
     """
     상품명 = row.get(COL_MAP["name"])
     브랜드명 = row.get(COL_MAP["brand"])
@@ -262,13 +361,12 @@ def validate_row(row):
     수수료율 = row.get(COL_MAP["commission_rate"])
     기재최저가 = row.get(COL_MAP["stated_lowest"])
     
-    # 판매가는 수식이라 빈 값일 수 있음 → 직접 계산
+    # 판매가 직접 계산
     if pd.notna(공급가) and pd.notna(수수료율) and 수수료율 < 1:
-        판매가 = round(공급가 / (1 - 수수료율), -1)  # 10원 단위 반올림
+        판매가 = round(공급가 / (1 - 수수료율), -1)
     else:
         판매가 = None
     
-    # 상품명이 없으면 검수 불가
     if pd.isna(상품명) or not str(상품명).strip():
         return {
             "_api_limit": False,
@@ -280,7 +378,7 @@ def validate_row(row):
         }
     
     # 네이버 가격 조회
-    naver = search_naver_price(상품명, 브랜드명)
+    naver = search_naver_price(상품명, 브랜드명, stated_lowest=기재최저가)
     
     if naver["status"] == "API_LIMIT":
         return {"_api_limit": True}
@@ -289,7 +387,7 @@ def validate_row(row):
     total_count = naver["total_count"]
     all_prices = naver["all_prices"]
     
-    # 시장 풍부도 표현 (옵션 A: 숫자만)
+    # 시장 풍부도
     if total_count is None or total_count == 0:
         풍부도 = "0건"
     elif all_prices:
@@ -315,30 +413,28 @@ def validate_row(row):
     
     # 메모 조각 모으기
     메모조각 = []
-    
     if naver["status"] != "OK":
         메모조각.append(naver["message"])
+    elif naver.get("message") and naver["message"] != "정상":
+        # 완화 검색 등 OK이지만 메시지가 있는 경우 (예: "완화 검색으로 매칭")
+        메모조각.append(naver["message"])
     
-    # 가격 변동성 감지
     if naver["status"] == "OK" and all_prices:
         is_anomaly, anomaly_msg = detect_price_anomaly(all_prices)
         if is_anomaly:
             메모조각.append(anomaly_msg)
     
-    # 기재가-조회가 정합성 (5% 초과 차이 시 메모)
     if 조회가 and pd.notna(기재최저가):
         차액 = int(기재최저가) - 조회가
         차이율_abs = abs(차액 / 조회가) * 100 if 조회가 else 0
-        if 차이율_abs > 5:
+        if 차이율_abs > tolerance_pct:
             if 차액 > 0:
                 메모조각.append(f"기재 최저가가 조회가보다 {차이율_abs:.1f}% 높음. 브랜드사에 정정 요청 필요.")
             else:
                 메모조각.append(f"기재 최저가가 조회가보다 {차이율_abs:.1f}% 낮음. 브랜드사에 정정 요청 필요.")
     
-    # 가격 경쟁력 (우리 판매가 vs 조회가)
     if 판매가 and 조회가 and 판매가 > 조회가:
         경쟁률 = ((판매가 - 조회가) / 조회가) * 100
-        # 역산 공급가: 조회가를 이기려면 공급가가 얼마여야 하나
         if 수수료율 and 수수료율 < 1:
             목표공급가 = int(조회가 * (1 - 수수료율))
             메모조각.append(f"판매가 {int(판매가):,}원이 네이버 조회가 {조회가:,}원보다 {경쟁률:.1f}% 비쌈. 공급가 {목표공급가:,}원 이하로 협상 시 경쟁력 확보.")
@@ -346,16 +442,11 @@ def validate_row(row):
     검수메모 = " / ".join(메모조각) if 메모조각 else "—"
     
     # 종합 결과 판정
-    # 승인 가능 조건:
-    #   - 매칭 성공 (status == OK)
-    #   - AND 우리 판매가 ≤ 조회가 (가격 경쟁력)
-    #   - AND 기재가-조회가 차이 ±5% 이내
-    #   - AND 가격 변동성 신호 없음
     is_match_ok = naver["status"] == "OK"
     is_price_competitive = not (판매가 and 조회가 and 판매가 > 조회가)
     is_stated_close = True
     if 조회가 and pd.notna(기재최저가):
-        is_stated_close = abs(int(기재최저가) - 조회가) / 조회가 * 100 <= 5
+        is_stated_close = abs(int(기재최저가) - 조회가) / 조회가 * 100 <= tolerance_pct
     is_no_anomaly = True
     if naver["status"] == "OK" and all_prices:
         is_anomaly, _ = detect_price_anomaly(all_prices)
@@ -379,21 +470,9 @@ def validate_row(row):
 # ============================================================
 # 전체 검수
 # ============================================================
-def validate_excel_file(file_path_or_bytes, progress_callback=None):
-    """엑셀 파일 경로 또는 파일 객체를 받아 첫 시트를 검수.
-    
-    새 양식(애드웰)의 첫 시트('애드웰 상품견적서')를 처리한다.
-    원본 헤더는 2행에 있으므로 header=1로 읽는다.
-    
-    progress_callback(idx, total, product_name) 형태로 진행률 알림.
-    
-    반환: (검수결과 리스트, 원본 DataFrame)
-    각 원소는 dict (validate_row 반환값).
-    """
-    # 새 양식: 헤더가 2행에 있음 (1행은 제목, 2행이 실제 헤더)
+def validate_excel_file(file_path_or_bytes, progress_callback=None, tolerance_pct=5.0):
+    """엑셀 파일 경로 또는 파일 객체를 받아 첫 시트를 검수."""
     df = pd.read_excel(file_path_or_bytes, sheet_name=0, header=1)
-    
-    # 상품명이 있는 행만 검수 대상
     name_col = COL_MAP["name"]
     df_valid = df.dropna(subset=[name_col]).reset_index(drop=True)
     
@@ -402,11 +481,9 @@ def validate_excel_file(file_path_or_bytes, progress_callback=None):
         if progress_callback:
             progress_callback(index, len(df_valid), str(row[name_col]))
         
-        result = validate_row(row)
-        
+        result = validate_row(row, tolerance_pct=tolerance_pct)
         if result.get("_api_limit"):
             break
-        
         result.pop("_api_limit", None)
         results.append(result)
     

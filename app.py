@@ -6,7 +6,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 from io import BytesIO
-from core import validate_excel_file, set_credentials, COL_MAP
+from core import validate_row, set_credentials, COL_MAP
 from excel_writer import append_results_to_excel
 
 # 1) 페이지 설정 — 반드시 가장 먼저
@@ -24,6 +24,14 @@ try:
     )
 except Exception:
     pass
+
+
+# 세션 상태 초기화
+if "results" not in st.session_state:
+    st.session_state.results = None
+    st.session_state.df_validated = None
+    st.session_state.file_bytes = None
+    st.session_state.file_name = None
 
 
 st.title("📋 입점 상품 최저가 검수")
@@ -52,8 +60,17 @@ with st.sidebar:
     
     st.divider()
     
-    test_mode = st.checkbox("테스트 모드 (처음 10건만 처리)", value=True)
+    test_mode = st.checkbox("테스트 모드 (처음 N건만 처리)", value=True)
     test_limit = st.number_input("처리 건수", min_value=1, max_value=100, value=10, disabled=not test_mode)
+    
+    st.divider()
+    st.markdown("**검수 기준**")
+    tolerance_pct = st.slider(
+        "기재가 정합성 허용 오차",
+        min_value=1, max_value=20, value=5, step=1,
+        help="기재 최저가와 네이버 조회가의 차이가 이 % 범위 내면 정합한 것으로 판단합니다. 기본 5%."
+    )
+    st.caption(f"현재 ±{tolerance_pct}% 이내면 승인 가능")
 
 # ============================================================
 # 1) 파일 업로드
@@ -66,10 +83,16 @@ uploaded_file = st.file_uploader(
 
 if not uploaded_file:
     st.info("👆 위에 상품제안서 파일을 끌어다 놓거나 클릭하여 업로드하세요.")
+    st.session_state.results = None
     st.stop()
 
-# 업로드된 파일의 bytes를 보관 (다운로드 시 원본 사용)
+# 새 파일이 업로드되면 이전 결과 초기화
+if st.session_state.file_name != uploaded_file.name:
+    st.session_state.results = None
+    st.session_state.file_name = uploaded_file.name
+
 file_bytes = uploaded_file.getvalue()
+st.session_state.file_bytes = file_bytes
 
 # ============================================================
 # 2) 파일 미리보기
@@ -82,7 +105,7 @@ except Exception as e:
 
 name_col = COL_MAP["name"]
 if name_col not in df_preview.columns:
-    st.error(f"필수 컬럼을 찾지 못했습니다. 양식이 '애드웰 상품제안서'와 일치하는지 확인해주세요.")
+    st.error("필수 컬럼을 찾지 못했습니다. 양식이 '애드웰 상품제안서'와 일치하는지 확인해주세요.")
     st.stop()
 
 df_valid = df_preview.dropna(subset=[name_col])
@@ -90,9 +113,8 @@ df_valid = df_preview.dropna(subset=[name_col])
 st.success(f"파일 업로드 완료: **{uploaded_file.name}**")
 st.markdown(f"**검수 대상: {len(df_valid)}개 상품**")
 
-with st.expander("업로드된 파일 미리보기 (처음 5행)"):
-    # 미리보기용 가공: 수식 직접 계산 + 가격 콤마 처리
-    preview_df = df_valid.head(5).copy()
+with st.expander("업로드된 파일 미리보기"):
+    preview_df = df_valid.copy()
     
     sale_col = COL_MAP["sale_price"]
     supply_col = COL_MAP["supply_price"]
@@ -139,71 +161,73 @@ with st.expander("업로드된 파일 미리보기 (처음 5행)"):
                 lambda v: f"{int(round(float(v))):,}" if pd.notna(v) else "—"
             )
     
-    # 할인율은 백분율 형식
+    # 할인율 백분율 표시
     if discount_col in preview_df.columns:
         preview_df[discount_col] = preview_df[discount_col].apply(
             lambda v: f"{float(v)*100:.1f}%" if pd.notna(v) else "—"
         )
     
-    st.dataframe(preview_df, use_container_width=True)
+    # 전체 행 표시, 높이 고정으로 스크롤
+    st.dataframe(preview_df, use_container_width=True, height=300)
 
 # ============================================================
 # 3) 검수 실행
 # ============================================================
 start_button = st.button("🔍 검수 시작", type="primary", use_container_width=True)
 
-if not start_button:
-    st.stop()
-
-if test_mode and len(df_valid) > test_limit:
-    st.warning(f"⚠️ 테스트 모드: 처음 {test_limit}건만 처리합니다.")
-    # 테스트 모드 적용을 위해 BytesIO에서 N건만 잘라낸 새 bytes를 만들기는 복잡하므로,
-    # core에는 전체 파일을 주되, 결과만 처음 N건으로 자른다.
-    # 단, excel_writer에는 전체 원본을 그대로 전달하면 됨 (테스트 모드는 검수 범위만 제한).
-
-# 진행률 UI
-progress_bar = st.progress(0, text="검수 준비 중...")
-status_text = st.empty()
-
-def update_progress(idx, total, product_name):
-    progress = (idx + 1) / total if total > 0 else 1.0
-    progress_bar.progress(progress, text=f"[{idx+1}/{total}] {product_name}")
-    status_text.markdown(f"처리 중: **{product_name}**")
-
-# 실제 검수 실행
-limit_for_test = test_limit if test_mode else None
-
-with st.spinner("검수 진행 중..."):
-    try:
-        # 테스트 모드일 때만 처리 건수 제한
-        if limit_for_test:
-            # 임시 DataFrame을 만들어 처음 N건만 검수
-            from core import validate_row
-            df_limited = df_valid.head(limit_for_test).reset_index(drop=True)
+if start_button:
+    if test_mode and len(df_valid) > test_limit:
+        st.warning(f"⚠️ 테스트 모드: 처음 {test_limit}건만 처리합니다.")
+    
+    # 테스트 모드면 처음 N건, 아니면 전체
+    if test_mode:
+        df_target = df_valid.head(test_limit).reset_index(drop=True)
+    else:
+        df_target = df_valid.reset_index(drop=True)
+    
+    progress_bar = st.progress(0, text="검수 준비 중...")
+    status_text = st.empty()
+    
+    def update_progress(idx, total, product_name):
+        progress = (idx + 1) / total if total > 0 else 1.0
+        progress_bar.progress(progress, text=f"[{idx+1}/{total}] {product_name}")
+        status_text.markdown(f"처리 중: **{product_name}**")
+    
+    with st.spinner("검수 진행 중..."):
+        try:
             results = []
-            for idx, row in df_limited.iterrows():
-                update_progress(idx, len(df_limited), str(row[name_col]))
-                r = validate_row(row)
+            for idx, row in df_target.iterrows():
+                update_progress(idx, len(df_target), str(row[name_col]))
+                r = validate_row(row, tolerance_pct=tolerance_pct)
                 if r.get("_api_limit"):
                     st.warning("⚠️ API 한도 도달. 지금까지의 결과만 표시합니다.")
                     break
                 r.pop("_api_limit", None)
                 results.append(r)
-            df_validated = df_limited.head(len(results))
-        else:
-            results, df_validated = validate_excel_file(BytesIO(file_bytes), progress_callback=update_progress)
-    except Exception as e:
-        st.error(f"검수 중 오류 발생: {e}")
-        st.stop()
-
-progress_bar.progress(1.0, text="검수 완료")
-status_text.empty()
+            df_validated = df_target.head(len(results))
+        except Exception as e:
+            st.error(f"검수 중 오류 발생: {e}")
+            st.stop()
+    
+    progress_bar.progress(1.0, text="검수 완료")
+    status_text.empty()
+    
+    # 세션 상태에 저장 (필터 등으로 페이지가 재실행되어도 유지)
+    st.session_state.results = results
+    st.session_state.df_validated = df_validated
 
 # ============================================================
-# 4) 결과 표시
+# 4) 결과 표시 (세션 상태에서 가져옴)
 # ============================================================
+if st.session_state.results is None:
+    st.stop()
+
+results = st.session_state.results
+df_validated = st.session_state.df_validated
+
 st.divider()
 st.subheader("검수 결과")
+st.caption(f"기재가 정합성 허용 오차: ±{tolerance_pct}% (사이드바에서 조정 가능, 변경 시 '검수 시작' 다시 클릭)")
 
 승인_가능 = sum(1 for r in results if r["결과"] == "승인 가능")
 확인_필요 = len(results) - 승인_가능
@@ -213,7 +237,6 @@ col1.metric("전체 상품", f"{len(results)}건")
 col2.metric("승인 가능", f"{승인_가능}건")
 col3.metric("확인 필요", f"{확인_필요}건")
 
-# 필터
 filter_option = st.radio(
     "필터",
     ["전체", "확인 필요만", "승인 가능만"],
@@ -221,7 +244,6 @@ filter_option = st.radio(
 )
 
 # 화면용 DataFrame 구성
-
 def format_won(value):
     """숫자를 '8,624' 형태로 포맷. 빈 값은 '—'."""
     if value is None or value == "—":
@@ -238,7 +260,7 @@ def format_won(value):
 
 
 def compute_sale_price(supply, rate):
-    """판매가 수식 직접 계산: 공급가 / (1 - 수수료율), 10원 단위 반올림."""
+    """판매가 수식 직접 계산."""
     try:
         if pd.isna(supply) or pd.isna(rate) or rate >= 1:
             return None
@@ -256,7 +278,6 @@ for i, (_, row) in enumerate(df_validated.iterrows()):
     공급가 = row.get(COL_MAP["supply_price"])
     수수료율 = row.get(COL_MAP["commission_rate"])
     판매가 = row.get(COL_MAP["sale_price"])
-    # 판매가가 수식이라 None이면 직접 계산
     if 판매가 is None or (isinstance(판매가, float) and pd.isna(판매가)):
         판매가 = compute_sale_price(공급가, 수수료율)
     
@@ -276,13 +297,11 @@ for i, (_, row) in enumerate(df_validated.iterrows()):
 
 display_df = pd.DataFrame(display_rows)
 
-# 필터 적용
 if filter_option == "확인 필요만":
     display_df = display_df[display_df["결과"] == "확인 필요"]
 elif filter_option == "승인 가능만":
     display_df = display_df[display_df["결과"] == "승인 가능"]
 
-# 색상 강조
 def highlight_row(row):
     color = "#FAEEDA" if row["결과"] == "확인 필요" else "#EAF3DE"
     return [f"background-color: {color}"] * len(row)
@@ -296,8 +315,8 @@ st.dataframe(styled, use_container_width=True, height=420)
 st.divider()
 
 try:
-    output_bytes = append_results_to_excel(file_bytes, results)
-    filename = uploaded_file.name.replace(".xlsx", f"_검수완료_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+    output_bytes = append_results_to_excel(st.session_state.file_bytes, results)
+    filename = st.session_state.file_name.replace(".xlsx", f"_검수완료_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
     
     st.download_button(
         label="📥 검수 결과가 추가된 엑셀 다운로드",
